@@ -1,3 +1,6 @@
 [submodule "releases/41_blackbird/lua"]
 	path = releases/41_blackbird/lua
 	url = https://github.com/dessertplanet/lua.git
+[submodule "releases/67_arps/web/reference/grid-hello"]
+	path = releases/67_arps/web/reference/grid-hello
+	url = https://github.com/schollz/grid-hello.git

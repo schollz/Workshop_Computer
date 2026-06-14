@@ -28,6 +28,8 @@ const MODULE_COLS = 7;
 const MODULE_ROWS = 5;
 const DIM_MODULE_LEVEL = 2;
 const STORAGE_KEY = "grid-arpeggiator:settings:v1";
+type GridApp = "yarp" | "pitter-patter";
+
 const DEFAULT_SYNTH: SynthSettings = {
   wave: "square",
   attack: 0.012,
@@ -39,6 +41,7 @@ const DEFAULT_SYNTH: SynthSettings = {
 };
 
 interface StoredAppSettings {
+  activeApp: GridApp;
   clusterText: string;
   bpm: number;
   ledCurve: number;
@@ -52,6 +55,7 @@ export default function App() {
   const storedSettings = loadStoredSettings();
   const [cols, setCols] = useState(DEFAULT_COLS);
   const [rows, setRows] = useState(DEFAULT_ROWS);
+  const [activeApp, setActiveApp] = useState<GridApp>(() => storedSettings?.activeApp ?? "yarp");
   const [clusterText, setClusterText] = useState(() => storedSettings?.clusterText ?? DEFAULT_CLUSTERS);
   const [activeColumn, setActiveColumn] = useState<number | null>(null);
   const [bpm, setBpm] = useState(() => storedSettings?.bpm ?? 120);
@@ -68,6 +72,7 @@ export default function App() {
 
   const audioRef = useRef<AudioEngine | null>(null);
   const gridRef = useRef<MonomeGridSerial | null>(null);
+  const activeAppRef = useRef<GridApp>(storedSettings?.activeApp ?? "yarp");
   const ledCurveRef = useRef(ledCurve);
   const activeRef = useRef(activeColumn);
   const pendingRef = useRef<number | null>(pendingColumn);
@@ -97,6 +102,10 @@ export default function App() {
   const parsed = useMemo(() => parseClusterText(clusterText), [clusterText]);
   const clusters = parsed.clusters;
   const focusedArpSettings = arpSettingsByCluster[focusedColumn] ?? DEFAULT_ARP_SETTINGS;
+
+  useEffect(() => {
+    activeAppRef.current = activeApp;
+  }, [activeApp]);
 
   useEffect(() => {
     clustersRef.current = clusters;
@@ -135,6 +144,7 @@ export default function App() {
 
   useEffect(() => {
     const snapshot = {
+      activeApp,
       clusterText,
       bpm,
       ledCurve,
@@ -150,7 +160,7 @@ export default function App() {
 
     clearedStorageSnapshotRef.current = null;
     saveStoredSettings(snapshot);
-  }, [arpSettingsByCluster, bpm, clusterText, ledCurve, synth]);
+  }, [activeApp, arpSettingsByCluster, bpm, clusterText, ledCurve, synth]);
 
   const clearArpRuntime = useCallback(() => {
     movementStepRef.current = 0;
@@ -205,6 +215,12 @@ export default function App() {
     applyArpSettingsForColumn(column, nextSettings);
   }, [applyArpSettingsForColumn, settingsForColumn]);
 
+  const switchApp = useCallback((nextApp: GridApp) => {
+    activeAppRef.current = nextApp;
+    setActiveApp(nextApp);
+    setBlanked(false);
+  }, []);
+
   const requestColumn = useCallback((x: number, validClusters = clustersRef.current.length) => {
     if (x >= validClusters || x >= 16) return;
     setBlanked(false);
@@ -226,6 +242,8 @@ export default function App() {
 
   const handleGridKey = useCallback((x: number, y: number, down: boolean) => {
     if (!down) return;
+    if (activeAppRef.current !== "yarp") return;
+
     if (y === rows - 1) {
       if (x >= clustersRef.current.length || x >= 16) return;
       void audioRef.current?.ensure().then(() => setAudioOn(true)).catch(() => undefined);
@@ -274,6 +292,7 @@ export default function App() {
 
   const levels = useMemo(() => {
     if (blanked) return makeGridLevels(cols, rows, 0);
+    if (activeApp !== "yarp") return makeGridLevels(cols, rows, 0);
 
     const next = makeGridLevels(cols, rows, 0);
     const bottom = rows - 1;
@@ -294,7 +313,7 @@ export default function App() {
     }
 
     return next;
-  }, [activeColumn, blanked, clusters.length, cols, focusedArpSettings, playStep, rows]);
+  }, [activeApp, activeColumn, blanked, clusters.length, cols, focusedArpSettings, playStep, rows]);
 
   useEffect(() => {
     gridRef.current?.drawQueued(levels);
@@ -302,6 +321,8 @@ export default function App() {
 
   useEffect(() => {
     const tick = () => {
+      if (activeAppRef.current !== "yarp") return;
+
       let column = activeRef.current;
       if (pendingRef.current !== null) {
         column = pendingRef.current;
@@ -436,6 +457,8 @@ export default function App() {
     clearedStorageSnapshotRef.current = storedSettingsFingerprint(defaultStoredSettings());
     clearStoredSettings();
     const defaultArpSettingsByCluster = defaultStoredSettings().arpSettingsByCluster;
+    activeAppRef.current = "yarp";
+    setActiveApp("yarp");
     setClusterText(DEFAULT_CLUSTERS);
     activeRef.current = null;
     pendingRef.current = null;
@@ -476,6 +499,8 @@ export default function App() {
   };
 
   const pressCell = async (x: number, y: number) => {
+    if (activeApp !== "yarp") return;
+
     if (y === rows - 1) {
       if (x >= clusters.length || x >= 16) return;
       requestColumn(x, clusters.length);
@@ -497,14 +522,19 @@ export default function App() {
     <main>
       <header>
         <div>
-          <h1>grid arpeggiator</h1>
-          <p>16-column note clusters for monome grid and browser WebAudio.</p>
+          <h1>workshop grid apps</h1>
+          <p>select a browser app for monome grid and WebAudio.</p>
         </div>
         <div className="top-actions">
           <button id="connect" type="button" onClick={connect} disabled={connected}>Connect grid</button>
           <button className="secondary" type="button" onClick={enableAudio}>{audioOn ? "Audio on" : "Enable audio"}</button>
         </div>
       </header>
+
+      <nav className="app-switcher" aria-label="apps">
+        <button type="button" className={activeApp === "yarp" ? "active" : ""} aria-pressed={activeApp === "yarp"} onClick={() => switchApp("yarp")}>yarp</button>
+        <button type="button" className={activeApp === "pitter-patter" ? "active" : ""} aria-pressed={activeApp === "pitter-patter"} onClick={() => switchApp("pitter-patter")}>pitter-patter</button>
+      </nav>
 
       <section className="tempo" aria-label="master tempo">
         <label className="param">
@@ -554,7 +584,9 @@ export default function App() {
           </div>
         </div>
 
-        <section className="engine-panel" aria-label="arpeggiator and synth engine">
+        {activeApp === "yarp" ? (
+          <>
+        <section className="engine-panel" aria-label="yarp arpeggiator and synth engine">
           <h2>clusters</h2>
           <label className="cluster-editor">
             <span>notes</span>
@@ -621,7 +653,7 @@ export default function App() {
         </section>
 
         <aside className="readme" aria-label="arpeggiator instructions">
-          <h2>program</h2>
+          <h2>yarp</h2>
           <p>Each valid token becomes one bottom-row key, left to right. Press a populated bottom-row key to make it the only active cluster. Press it again to stop.</p>
           <ul>
             <li>Notes: <code>c4</code>, <code>f#3</code>, <code>bb5</code>.</li>
@@ -630,6 +662,13 @@ export default function App() {
             <li>Separators: spaces, commas, or newlines. Semicolons only set chord octaves, as in <code>C;3</code>.</li>
           </ul>
         </aside>
+          </>
+        ) : (
+          <section className="placeholder-panel" aria-label="pitter-patter app placeholder">
+            <h2>pitter-patter</h2>
+            <p>no controls yet.</p>
+          </section>
+        )}
       </section>
 
       <section className="notes" aria-label="connection notes">
@@ -647,6 +686,7 @@ export default function App() {
 
 function defaultStoredSettings(): StoredAppSettings {
   return {
+    activeApp: "yarp",
     clusterText: DEFAULT_CLUSTERS,
     bpm: 120,
     ledCurve: 45,
@@ -704,6 +744,7 @@ function normalizeStoredSettings(value: unknown): StoredAppSettings | null {
   const clusterCount = parseClusterText(clusterText).clusters.length;
 
   return {
+    activeApp: isGridApp(value.activeApp) ? value.activeApp : "yarp",
     clusterText,
     bpm: boundedNumber(value.bpm, 40, 220, 120),
     ledCurve: boundedNumber(value.ledCurve, 0, 100, 45),
@@ -755,6 +796,10 @@ function boundedNumber(value: unknown, min: number, max: number, fallback: numbe
 
 function isSynthWave(value: unknown): value is SynthWave {
   return value === "square" || value === "sawtooth" || value === "triangle" || value === "sine";
+}
+
+function isGridApp(value: unknown): value is GridApp {
+  return value === "yarp" || value === "pitter-patter";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

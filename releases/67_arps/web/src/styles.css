@@ -196,6 +196,23 @@ code {
   align-items: center;
 }
 
+.app-switcher {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.app-switcher button {
+  min-width: 116px;
+}
+
+.app-switcher button.active {
+  background: color-mix(in srgb, var(--signal) 22%, var(--panel));
+  border-color: color-mix(in srgb, var(--signal) 72%, var(--line));
+  color: var(--accent-strong);
+}
+
 .tempo {
   display: grid;
   gap: 7px;
@@ -309,12 +326,17 @@ code {
 }
 
 .engine-panel,
-.readme {
+.readme,
+.placeholder-panel {
   display: grid;
   gap: 10px;
   min-width: 0;
   border-top: 1px solid var(--line);
   padding-top: 13px;
+}
+
+.placeholder-panel {
+  grid-column: span 2;
 }
 
 .param {

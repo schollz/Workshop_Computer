@@ -19,6 +19,23 @@ import {
 } from "./arpModules";
 import { makeGridLevels, MonomeGridSerial, type GridLevels } from "./gridSerial";
 import { parseClusterText, type ParsedNote } from "./noteParser";
+import {
+  advancePitterState,
+  buildPitterLevels,
+  clearPitterTrack,
+  clearPitterVisible,
+  createDefaultPitterState,
+  handlePitterGridKey,
+  normalizePitterState,
+  PITTER_DIRECTIONS,
+  PITTER_DIVISIONS,
+  PITTER_DIVISION_LABELS,
+  setPitterActiveTrack,
+  setPitterPlaying,
+  setPitterTrackParam,
+  type PitterDirection,
+  type PitterState
+} from "./pitterPatter";
 
 const DEFAULT_COLS = 16;
 const DEFAULT_ROWS = 8;
@@ -33,7 +50,7 @@ type GridApp = "yarp" | "pitter-patter";
 const DEFAULT_SYNTH: SynthSettings = {
   wave: "square",
   attack: 0.012,
-  decay: 0.2,
+  release: 0.2,
   filter: 2600,
   q: 0.8,
   drive: 1.4,
@@ -47,6 +64,7 @@ interface StoredAppSettings {
   ledCurve: number;
   synth: SynthSettings;
   arpSettingsByCluster: ArpSettings[];
+  pitterPatter: PitterState;
 }
 
 let cachedStoredSettings: StoredAppSettings | null | undefined;
@@ -69,6 +87,7 @@ export default function App() {
   const [pendingColumn, setPendingColumn] = useState<number | null>(null);
   const [focusedColumn, setFocusedColumn] = useState(0);
   const [arpSettingsByCluster, setArpSettingsByCluster] = useState<ArpSettings[]>(() => storedSettings?.arpSettingsByCluster ?? []);
+  const [pitterPatter, setPitterPatter] = useState<PitterState>(() => storedSettings?.pitterPatter ?? createDefaultPitterState());
 
   const audioRef = useRef<AudioEngine | null>(null);
   const gridRef = useRef<MonomeGridSerial | null>(null);
@@ -78,6 +97,7 @@ export default function App() {
   const pendingRef = useRef<number | null>(pendingColumn);
   const focusedColumnRef = useRef(0);
   const arpSettingsByClusterRef = useRef<ArpSettings[]>(storedSettings?.arpSettingsByCluster ?? []);
+  const pitterPatterRef = useRef<PitterState>(storedSettings?.pitterPatter ?? createDefaultPitterState());
   const clustersRef = useRef(parseClusterText(DEFAULT_CLUSTERS).clusters);
   const movementStepRef = useRef(0);
   const previousIndexRef = useRef<number | null>(null);
@@ -88,8 +108,10 @@ export default function App() {
   const lastEmittedNoteRef = useRef<ParsedNote | null>(null);
   const avoidIndexRef = useRef<number | null>(null);
   const tickCountRef = useRef(0);
+  const pitterTickRef = useRef(0);
   const downCellRef = useRef<string | null>(null);
   const clearedStorageSnapshotRef = useRef<string | null>(null);
+  const storedSettingsFingerprintRef = useRef<string | null>(null);
 
   if (!audioRef.current) {
     const engine = new AudioEngine();
@@ -102,6 +124,7 @@ export default function App() {
   const parsed = useMemo(() => parseClusterText(clusterText), [clusterText]);
   const clusters = parsed.clusters;
   const focusedArpSettings = arpSettingsByCluster[focusedColumn] ?? DEFAULT_ARP_SETTINGS;
+  const pitterTrack = pitterPatter.tracks[pitterPatter.activeTrack];
 
   useEffect(() => {
     activeAppRef.current = activeApp;
@@ -132,6 +155,10 @@ export default function App() {
   }, [arpSettingsByCluster]);
 
   useEffect(() => {
+    pitterPatterRef.current = pitterPatter;
+  }, [pitterPatter]);
+
+  useEffect(() => {
     setArpSettingsByCluster((current) => reconcileArpSettingsByCluster(current, clusters.length));
     if (clusters.length === 0 && focusedColumnRef.current !== 0) {
       focusedColumnRef.current = 0;
@@ -149,18 +176,23 @@ export default function App() {
       bpm,
       ledCurve,
       synth,
-      arpSettingsByCluster
+      arpSettingsByCluster,
+      pitterPatter: pitterStateForStorage(pitterPatter)
     };
     const fingerprint = storedSettingsFingerprint(snapshot);
 
     if (clearedStorageSnapshotRef.current === fingerprint) {
       clearStoredSettings();
+      storedSettingsFingerprintRef.current = null;
       return;
     }
 
+    if (storedSettingsFingerprintRef.current === fingerprint) return;
+
     clearedStorageSnapshotRef.current = null;
+    storedSettingsFingerprintRef.current = fingerprint;
     saveStoredSettings(snapshot);
-  }, [activeApp, arpSettingsByCluster, bpm, clusterText, ledCurve, synth]);
+  }, [activeApp, arpSettingsByCluster, bpm, clusterText, ledCurve, pitterPatter, synth]);
 
   const clearArpRuntime = useCallback(() => {
     movementStepRef.current = 0;
@@ -221,6 +253,36 @@ export default function App() {
     setBlanked(false);
   }, []);
 
+  const updatePitterPatter = useCallback((update: (state: PitterState) => PitterState) => {
+    const nextState = update(pitterPatterRef.current);
+    pitterPatterRef.current = nextState;
+    setPitterPatter(nextState);
+    setBlanked(false);
+  }, []);
+
+  const requestPitterGridKey = useCallback((x: number, y: number, down: boolean) => {
+    setBlanked(false);
+    const nextState = handlePitterGridKey(pitterPatterRef.current, x, y, down, performance.now(), cols, rows);
+    pitterPatterRef.current = nextState;
+    setPitterPatter(nextState);
+    if (down) {
+      void audioRef.current?.ensure().then(() => setAudioOn(true)).catch(() => undefined);
+    }
+  }, [cols, rows]);
+
+  const togglePitterPlaying = useCallback(async () => {
+    const nextPlaying = !pitterPatterRef.current.playing;
+    if (nextPlaying) {
+      try {
+        await audioRef.current?.ensure();
+        setAudioOn(true);
+      } catch (error) {
+        setStatus(`Audio failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    updatePitterPatter((state) => setPitterPlaying(state, nextPlaying));
+  }, [updatePitterPatter]);
+
   const requestColumn = useCallback((x: number, validClusters = clustersRef.current.length) => {
     if (x >= validClusters || x >= 16) return;
     setBlanked(false);
@@ -241,8 +303,12 @@ export default function App() {
   }, [clearArpRuntime]);
 
   const handleGridKey = useCallback((x: number, y: number, down: boolean) => {
-    if (!down) return;
-    if (activeAppRef.current !== "yarp") return;
+    if (activeAppRef.current === "pitter-patter") {
+      requestPitterGridKey(x, y, down);
+      return;
+    }
+
+    if (!down || activeAppRef.current !== "yarp") return;
 
     if (y === rows - 1) {
       if (x >= clustersRef.current.length || x >= 16) return;
@@ -255,7 +321,7 @@ export default function App() {
       requestArpModuleOption(x, y);
       return;
     }
-  }, [requestArpModuleOption, requestColumn, rows]);
+  }, [requestArpModuleOption, requestColumn, requestPitterGridKey, rows]);
 
   if (!gridRef.current) {
     gridRef.current = new MonomeGridSerial({
@@ -292,6 +358,7 @@ export default function App() {
 
   const levels = useMemo(() => {
     if (blanked) return makeGridLevels(cols, rows, 0);
+    if (activeApp === "pitter-patter") return buildPitterLevels(pitterPatter, cols, rows);
     if (activeApp !== "yarp") return makeGridLevels(cols, rows, 0);
 
     const next = makeGridLevels(cols, rows, 0);
@@ -313,7 +380,7 @@ export default function App() {
     }
 
     return next;
-  }, [activeApp, activeColumn, blanked, clusters.length, cols, focusedArpSettings, playStep, rows]);
+  }, [activeApp, activeColumn, blanked, clusters.length, cols, focusedArpSettings, pitterPatter, playStep, rows]);
 
   useEffect(() => {
     gridRef.current?.drawQueued(levels);
@@ -404,6 +471,27 @@ export default function App() {
   }, [alignArpRuntime, bpm, settingsForColumn]);
 
   useEffect(() => {
+    const tick = () => {
+      if (activeAppRef.current !== "pitter-patter") return;
+      const result = advancePitterState(pitterPatterRef.current, pitterTickRef.current);
+      pitterTickRef.current += 1;
+      if (result.state !== pitterPatterRef.current) {
+        pitterPatterRef.current = result.state;
+        setPitterPatter(result.state);
+      }
+
+      for (const event of result.events) {
+        const pan = [-0.45, -0.15, 0.15, 0.45][event.trackId] ?? 0;
+        const amp = 0.08 + (event.velocity / 127) * 0.1;
+        audioRef.current?.playMidi(event.midi, pitterGateSeconds(bpm, event.divisionIndex, event.gateSteps), amp, pan);
+      }
+    };
+
+    const timer = window.setInterval(tick, pitterStepMs(bpm));
+    return () => window.clearInterval(timer);
+  }, [bpm]);
+
+  useEffect(() => {
     return () => {
       if (gridRef.current?.connected) {
         void gridRef.current.disconnect();
@@ -471,6 +559,10 @@ export default function App() {
     setBlanked(false);
     arpSettingsByClusterRef.current = defaultArpSettingsByCluster;
     setArpSettingsByCluster(defaultArpSettingsByCluster);
+    const defaultPitterPatter = createDefaultPitterState();
+    pitterPatterRef.current = defaultPitterPatter;
+    setPitterPatter(defaultPitterPatter);
+    pitterTickRef.current = 0;
     clearArpRuntime();
     const engine = audioRef.current;
     if (engine) {
@@ -499,6 +591,11 @@ export default function App() {
   };
 
   const pressCell = async (x: number, y: number) => {
+    if (activeApp === "pitter-patter") {
+      requestPitterGridKey(x, y, true);
+      return;
+    }
+
     if (activeApp !== "yarp") return;
 
     if (y === rows - 1) {
@@ -517,6 +614,33 @@ export default function App() {
       requestArpModuleOption(x, y);
     }
   };
+
+  const releaseCell = (x: number, y: number) => {
+    if (activeApp === "pitter-patter") {
+      requestPitterGridKey(x, y, false);
+    }
+  };
+
+  const synthControls = (
+    <section className="synth-panel" aria-label="shared synth engine">
+      <h2>synth</h2>
+      <label className="param param-select">
+        <span>wave</span>
+        <select value={synth.wave} onChange={(event) => setSynthParam("wave", event.target.value as SynthWave)}>
+          <option value="square">square</option>
+          <option value="sawtooth">saw</option>
+          <option value="triangle">tri</option>
+          <option value="sine">sine</option>
+        </select>
+      </label>
+      <SynthSlider label="attack" min={0.003} max={0.6} step={0.001} value={synth.attack} display={formatMs(synth.attack)} onChange={(value) => setSynthParam("attack", value)} />
+      <SynthSlider label="release" min={0.04} max={1.6} step={0.01} value={synth.release} display={formatMs(synth.release)} onChange={(value) => setSynthParam("release", value)} />
+      <SynthSlider label="lowpass" min={220} max={12000} step={10} value={synth.filter} display={formatHz(synth.filter)} onChange={(value) => setSynthParam("filter", value)} />
+      <SynthSlider label="q" min={0.1} max={12} step={0.1} value={synth.q} display={synth.q.toFixed(1)} onChange={(value) => setSynthParam("q", value)} />
+      <SynthSlider label="drive" min={1} max={8} step={0.1} value={synth.drive} display={synth.drive.toFixed(1)} onChange={(value) => setSynthParam("drive", value)} />
+      <SynthSlider label="level" min={0.15} max={0.9} step={0.01} value={synth.level} display={String(Math.round(synth.level * 100))} onChange={(value) => setSynthParam("level", value)} />
+    </section>
+  );
 
   return (
     <main>
@@ -577,6 +701,11 @@ export default function App() {
                   void pressCell(x, y);
                 }}
                 onPointerUp={() => {
+                  releaseCell(x, y);
+                  downCellRef.current = null;
+                }}
+                onPointerCancel={() => {
+                  releaseCell(x, y);
                   downCellRef.current = null;
                 }}
               />
@@ -634,22 +763,6 @@ export default function App() {
             ))}
           </dl>
 
-          <h2>synth</h2>
-          <label className="param param-select">
-            <span>wave</span>
-            <select value={synth.wave} onChange={(event) => setSynthParam("wave", event.target.value as SynthWave)}>
-              <option value="square">square</option>
-              <option value="sawtooth">saw</option>
-              <option value="triangle">tri</option>
-              <option value="sine">sine</option>
-            </select>
-          </label>
-          <SynthSlider label="attack" min={0.003} max={0.6} step={0.001} value={synth.attack} display={formatMs(synth.attack)} onChange={(value) => setSynthParam("attack", value)} />
-          <SynthSlider label="decay" min={0.04} max={1.6} step={0.01} value={synth.decay} display={formatMs(synth.decay)} onChange={(value) => setSynthParam("decay", value)} />
-          <SynthSlider label="lowpass" min={220} max={12000} step={10} value={synth.filter} display={formatHz(synth.filter)} onChange={(value) => setSynthParam("filter", value)} />
-          <SynthSlider label="q" min={0.1} max={12} step={0.1} value={synth.q} display={synth.q.toFixed(1)} onChange={(value) => setSynthParam("q", value)} />
-          <SynthSlider label="drive" min={1} max={8} step={0.1} value={synth.drive} display={synth.drive.toFixed(1)} onChange={(value) => setSynthParam("drive", value)} />
-          <SynthSlider label="level" min={0.15} max={0.9} step={0.01} value={synth.level} display={String(Math.round(synth.level * 100))} onChange={(value) => setSynthParam("level", value)} />
         </section>
 
         <aside className="readme" aria-label="arpeggiator instructions">
@@ -664,11 +777,78 @@ export default function App() {
         </aside>
           </>
         ) : (
-          <section className="placeholder-panel" aria-label="pitter-patter app placeholder">
+          <section className="pitter-panel" aria-label="pitter-patter sequencer">
             <h2>pitter-patter</h2>
-            <p>no controls yet.</p>
+            <div className="track-tabs" aria-label="pitter-patter tracks">
+              {pitterPatter.tracks.map((track, index) => (
+                <button
+                  key={track.id}
+                  type="button"
+                  className={pitterPatter.activeTrack === index ? "active" : ""}
+                  onClick={() => updatePitterPatter((state) => setPitterActiveTrack(state, index))}
+                >
+                  track {index + 1}
+                </button>
+              ))}
+            </div>
+            <div className="pitter-actions">
+              <button type="button" onClick={() => void togglePitterPlaying()}>{pitterPatter.playing ? "stop" : "play"}</button>
+              <button type="button" className={pitterTrack?.muted ? "active" : ""} onClick={() => updatePitterPatter((state) => setPitterTrackParam(state, "muted", !pitterTrack?.muted))}>mute</button>
+              <button type="button" className={pitterTrack?.monophonic ? "active" : ""} onClick={() => updatePitterPatter((state) => setPitterTrackParam(state, "monophonic", !pitterTrack?.monophonic))}>mono</button>
+              <button type="button" className={pitterPatter.mode === "NOTE" ? "active" : ""} onClick={() => updatePitterPatter((state) => ({ ...state, mode: "NOTE" }))}>note</button>
+              <button type="button" className={pitterPatter.mode === "SEQUENCE" ? "active" : ""} onClick={() => updatePitterPatter((state) => ({ ...state, mode: "SEQUENCE" }))}>sequence</button>
+            </div>
+            {pitterTrack && (
+              <>
+                <label className="param param-select">
+                  <span>direction</span>
+                  <select value={pitterTrack.direction} onChange={(event) => updatePitterPatter((state) => setPitterTrackParam(state, "direction", event.target.value as PitterDirection))}>
+                    {PITTER_DIRECTIONS.map((direction) => <option key={direction} value={direction}>{direction.toLowerCase()}</option>)}
+                  </select>
+                </label>
+                <label className="param param-select">
+                  <span>division</span>
+                  <select value={pitterTrack.divisionIndex} onChange={(event) => updatePitterPatter((state) => setPitterTrackParam(state, "divisionIndex", Number(event.target.value)))}>
+                    {PITTER_DIVISION_LABELS.map((label, index) => <option key={label} value={index}>{label}</option>)}
+                  </select>
+                </label>
+                <label className="param">
+                  <span>length</span>
+                  <input type="range" min="2" max="64" step="1" value={pitterTrack.length} onChange={(event) => updatePitterPatter((state) => setPitterTrackParam(state, "length", Number(event.target.value)))} />
+                  <span>{pitterTrack.length}</span>
+                </label>
+                <label className="param">
+                  <span>prob</span>
+                  <input type="range" min="0" max="1" step="0.01" value={pitterTrack.probability} onChange={(event) => updatePitterPatter((state) => setPitterTrackParam(state, "probability", Number(event.target.value)))} />
+                  <span>{Math.round(pitterTrack.probability * 100)}%</span>
+                </label>
+                <div className="pitter-actions">
+                  <button className="secondary" type="button" onClick={() => updatePitterPatter(clearPitterVisible)}>Clear visible</button>
+                  <button className="secondary" type="button" onClick={() => updatePitterPatter(clearPitterTrack)}>Clear track</button>
+                </div>
+                <dl className="arp-readout">
+                  <div>
+                    <dt>mode</dt>
+                    <dd>{pitterPatter.mode}</dd>
+                  </div>
+                  <div>
+                    <dt>pattern</dt>
+                    <dd>{pitterTrack.activePattern + 1}</dd>
+                  </div>
+                  <div>
+                    <dt>step</dt>
+                    <dd>{pitterTrack.step + 1}</dd>
+                  </div>
+                  <div>
+                    <dt>offset</dt>
+                    <dd>{pitterTrack.noteOffset}</dd>
+                  </div>
+                </dl>
+              </>
+            )}
           </section>
         )}
+        {synthControls}
       </section>
 
       <section className="notes" aria-label="connection notes">
@@ -691,7 +871,8 @@ function defaultStoredSettings(): StoredAppSettings {
     bpm: 120,
     ledCurve: 45,
     synth: DEFAULT_SYNTH,
-    arpSettingsByCluster: reconcileArpSettingsByCluster([], parseClusterText(DEFAULT_CLUSTERS).clusters.length)
+    arpSettingsByCluster: reconcileArpSettingsByCluster([], parseClusterText(DEFAULT_CLUSTERS).clusters.length),
+    pitterPatter: createDefaultPitterState()
   };
 }
 
@@ -738,6 +919,14 @@ function storedSettingsFingerprint(settings: StoredAppSettings): string {
   return JSON.stringify(settings);
 }
 
+function pitterStateForStorage(state: PitterState): PitterState {
+  return {
+    ...state,
+    pressed: {},
+    tracks: state.tracks.map((track) => ({ ...track, step: 0, movement: 1 }))
+  };
+}
+
 function normalizeStoredSettings(value: unknown): StoredAppSettings | null {
   if (!isRecord(value)) return null;
   const clusterText = typeof value.clusterText === "string" ? value.clusterText : DEFAULT_CLUSTERS;
@@ -749,7 +938,8 @@ function normalizeStoredSettings(value: unknown): StoredAppSettings | null {
     bpm: boundedNumber(value.bpm, 40, 220, 120),
     ledCurve: boundedNumber(value.ledCurve, 0, 100, 45),
     synth: normalizeStoredSynth(value.synth),
-    arpSettingsByCluster: normalizeStoredArpSettingsByCluster(value.arpSettingsByCluster, clusterCount, value.arpSettings)
+    arpSettingsByCluster: normalizeStoredArpSettingsByCluster(value.arpSettingsByCluster, clusterCount, value.arpSettings),
+    pitterPatter: normalizePitterState(value.pitterPatter)
   };
 }
 
@@ -759,7 +949,7 @@ function normalizeStoredSynth(value: unknown): SynthSettings {
   return {
     wave: isSynthWave(record.wave) ? record.wave : DEFAULT_SYNTH.wave,
     attack: boundedNumber(record.attack, 0.003, 0.6, DEFAULT_SYNTH.attack),
-    decay: boundedNumber(record.decay, 0.04, 1.6, DEFAULT_SYNTH.decay),
+    release: boundedNumber(record.release ?? record.decay, 0.04, 1.6, DEFAULT_SYNTH.release),
     filter: boundedNumber(record.filter, 220, 12000, DEFAULT_SYNTH.filter),
     q: boundedNumber(record.q, 0.1, 12, DEFAULT_SYNTH.q),
     drive: boundedNumber(record.drive, 1, 8, DEFAULT_SYNTH.drive),
@@ -828,6 +1018,15 @@ function SynthSlider({ label, min, max, step, value, display, onChange }: SynthS
 
 function eighthMs(bpm: number): number {
   return 30000 / bpm;
+}
+
+function pitterStepMs(bpm: number): number {
+  return 60000 / bpm / 16;
+}
+
+function pitterGateSeconds(bpm: number, divisionIndex: number, gateSteps: number): number {
+  const division = PITTER_DIVISIONS[divisionIndex] ?? 1 / 16;
+  return (60000 / bpm / 1000) * division * Math.max(1, gateSteps) * 0.92;
 }
 
 function ledCurveLabel(value: number): string {

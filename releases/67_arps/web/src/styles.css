@@ -327,7 +327,9 @@ code {
 
 .engine-panel,
 .readme,
-.placeholder-panel {
+.placeholder-panel,
+.pitter-panel,
+.synth-panel {
   display: grid;
   gap: 10px;
   min-width: 0;
@@ -337,6 +339,25 @@ code {
 
 .placeholder-panel {
   grid-column: span 2;
+}
+
+.pitter-panel {
+  grid-column: span 2;
+  align-content: start;
+}
+
+.track-tabs,
+.pitter-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.track-tabs button.active,
+.pitter-actions button.active {
+  background: color-mix(in srgb, var(--app) 24%, var(--panel));
+  border-color: color-mix(in srgb, var(--signal) 58%, var(--line));
+  color: var(--accent-strong);
 }
 
 .param {

@@ -3,7 +3,7 @@ export type SynthWave = OscillatorType;
 export interface SynthSettings {
   wave: SynthWave;
   attack: number;
-  decay: number;
+  release: number;
   filter: number;
   q: number;
   drive: number;
@@ -23,7 +23,7 @@ export class AudioEngine {
   synth: SynthSettings = {
     wave: "square",
     attack: 0.012,
-    decay: 0.2,
+    release: 0.2,
     filter: 2600,
     q: 0.8,
     drive: 1.4,
@@ -106,7 +106,8 @@ export class AudioEngine {
     const gain = this.ctx.createGain();
     const panner = this.ctx.createStereoPanner();
     const attack = Math.max(0.003, this.synth.attack);
-    const decay = Math.max(0.025, dur, this.synth.decay);
+    const gate = Math.max(0.015, dur);
+    const release = Math.max(0.025, this.synth.release);
     const drive = Math.max(1, this.synth.drive);
     const drivePush = 1 + (drive - 1) * 0.28;
     const filterHz = clamp(this.synth.filter * drivePush, 80, 18000);
@@ -122,7 +123,8 @@ export class AudioEngine {
     postDrive.gain.value = 0.78 + Math.min(0.75, (drive - 1) * 0.13);
     gain.gain.setValueAtTime(0.0001, now);
     gain.gain.exponentialRampToValueAtTime(Math.max(0.0002, amp * (1 + (drive - 1) * 0.06)), now + attack);
-    gain.gain.exponentialRampToValueAtTime(0.0001, now + decay);
+    gain.gain.setTargetAtTime(Math.max(0.0002, amp * (1 + (drive - 1) * 0.06)), now + attack, 0.01);
+    gain.gain.setTargetAtTime(0.0001, now + attack + gate, release / 4);
     panner.pan.value = pan;
 
     osc.connect(preDrive);
@@ -139,7 +141,7 @@ export class AudioEngine {
       wet.connect(this.delay);
     }
     osc.start(now);
-    osc.stop(now + decay + 0.03);
+    osc.stop(now + attack + gate + release + 0.03);
   }
 }
 

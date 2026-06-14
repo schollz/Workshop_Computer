@@ -3,3 +3,4 @@ web/dist/
 web/.vite/
 web/.env.local
 web/.env.*.local
+web/reference/pitter-patter/

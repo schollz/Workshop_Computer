@@ -1,12 +1,33 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AudioEngine, type SynthSettings, type SynthWave } from "./audioEngine";
+import {
+  applyAnchor,
+  applyEmissionOctave,
+  applyNeighborhood,
+  applyProbability,
+  ARP_MODULES,
+  buildArpPool,
+  DEFAULT_ARP_SETTINGS,
+  findLiveTransitionIndex,
+  getMovementIndex,
+  movementCycleLength,
+  reconcileArpSettingsByCluster,
+  repeatTickCount,
+  selectArpOption,
+  stepAfterMovementIndex,
+  type ArpSettings
+} from "./arpModules";
 import { makeGridLevels, MonomeGridSerial, type GridLevels } from "./gridSerial";
-import { parseClusterText } from "./noteParser";
+import { parseClusterText, type ParsedNote } from "./noteParser";
 
 const DEFAULT_COLS = 16;
 const DEFAULT_ROWS = 8;
 const MAX_LEVEL = 15;
 const DEFAULT_CLUSTERS = "c4eg Cm7 Fmaj7 G7 Csus C6";
+const MODULE_COLS = 7;
+const MODULE_ROWS = 5;
+const DIM_MODULE_LEVEL = 2;
+const STORAGE_KEY = "grid-arpeggiator:settings:v1";
 const DEFAULT_SYNTH: SynthSettings = {
   wave: "square",
   attack: 0.012,
@@ -17,36 +38,65 @@ const DEFAULT_SYNTH: SynthSettings = {
   level: 0.55
 };
 
+interface StoredAppSettings {
+  clusterText: string;
+  bpm: number;
+  ledCurve: number;
+  synth: SynthSettings;
+  arpSettingsByCluster: ArpSettings[];
+}
+
+let cachedStoredSettings: StoredAppSettings | null | undefined;
+
 export default function App() {
+  const storedSettings = loadStoredSettings();
   const [cols, setCols] = useState(DEFAULT_COLS);
   const [rows, setRows] = useState(DEFAULT_ROWS);
-  const [clusterText, setClusterText] = useState(DEFAULT_CLUSTERS);
+  const [clusterText, setClusterText] = useState(() => storedSettings?.clusterText ?? DEFAULT_CLUSTERS);
   const [activeColumn, setActiveColumn] = useState<number | null>(null);
-  const [bpm, setBpm] = useState(120);
-  const [ledCurve, setLedCurve] = useState(45);
+  const [bpm, setBpm] = useState(() => storedSettings?.bpm ?? 120);
+  const [ledCurve, setLedCurve] = useState(() => storedSettings?.ledCurve ?? 45);
   const [status, setStatus] = useState("Waiting for a grid.");
   const [connected, setConnected] = useState(false);
   const [audioOn, setAudioOn] = useState(false);
-  const [synth, setSynth] = useState<SynthSettings>(DEFAULT_SYNTH);
+  const [synth, setSynth] = useState<SynthSettings>(() => storedSettings?.synth ?? DEFAULT_SYNTH);
   const [blanked, setBlanked] = useState(false);
   const [playStep, setPlayStep] = useState(0);
   const [pendingColumn, setPendingColumn] = useState<number | null>(null);
+  const [focusedColumn, setFocusedColumn] = useState(0);
+  const [arpSettingsByCluster, setArpSettingsByCluster] = useState<ArpSettings[]>(() => storedSettings?.arpSettingsByCluster ?? []);
 
   const audioRef = useRef<AudioEngine | null>(null);
   const gridRef = useRef<MonomeGridSerial | null>(null);
   const ledCurveRef = useRef(ledCurve);
   const activeRef = useRef(activeColumn);
   const pendingRef = useRef<number | null>(pendingColumn);
+  const focusedColumnRef = useRef(0);
+  const arpSettingsByClusterRef = useRef<ArpSettings[]>(storedSettings?.arpSettingsByCluster ?? []);
   const clustersRef = useRef(parseClusterText(DEFAULT_CLUSTERS).clusters);
-  const stepRef = useRef(0);
+  const movementStepRef = useRef(0);
+  const previousIndexRef = useRef<number | null>(null);
+  const anchorQueueRef = useRef<ParsedNote[]>([]);
+  const anchorEventRef = useRef(0);
+  const repeatNoteRef = useRef<ParsedNote | null>(null);
+  const repeatRemainingRef = useRef(0);
+  const lastEmittedNoteRef = useRef<ParsedNote | null>(null);
+  const avoidIndexRef = useRef<number | null>(null);
+  const tickCountRef = useRef(0);
   const downCellRef = useRef<string | null>(null);
+  const clearedStorageSnapshotRef = useRef<string | null>(null);
 
   if (!audioRef.current) {
-    audioRef.current = new AudioEngine();
+    const engine = new AudioEngine();
+    for (const [key, value] of Object.entries(synth) as [keyof SynthSettings, SynthSettings[keyof SynthSettings]][]) {
+      engine.setSynthParam(key, value);
+    }
+    audioRef.current = engine;
   }
 
   const parsed = useMemo(() => parseClusterText(clusterText), [clusterText]);
   const clusters = parsed.clusters;
+  const focusedArpSettings = arpSettingsByCluster[focusedColumn] ?? DEFAULT_ARP_SETTINGS;
 
   useEffect(() => {
     clustersRef.current = clusters;
@@ -64,29 +114,130 @@ export default function App() {
     pendingRef.current = pendingColumn;
   }, [pendingColumn]);
 
+  useEffect(() => {
+    focusedColumnRef.current = focusedColumn;
+  }, [focusedColumn]);
+
+  useEffect(() => {
+    arpSettingsByClusterRef.current = arpSettingsByCluster;
+  }, [arpSettingsByCluster]);
+
+  useEffect(() => {
+    setArpSettingsByCluster((current) => reconcileArpSettingsByCluster(current, clusters.length));
+    if (clusters.length === 0 && focusedColumnRef.current !== 0) {
+      focusedColumnRef.current = 0;
+      setFocusedColumn(0);
+    } else if (focusedColumnRef.current >= clusters.length && clusters.length > 0) {
+      focusedColumnRef.current = clusters.length - 1;
+      setFocusedColumn(clusters.length - 1);
+    }
+  }, [clusters.length]);
+
+  useEffect(() => {
+    const snapshot = {
+      clusterText,
+      bpm,
+      ledCurve,
+      synth,
+      arpSettingsByCluster
+    };
+    const fingerprint = storedSettingsFingerprint(snapshot);
+
+    if (clearedStorageSnapshotRef.current === fingerprint) {
+      clearStoredSettings();
+      return;
+    }
+
+    clearedStorageSnapshotRef.current = null;
+    saveStoredSettings(snapshot);
+  }, [arpSettingsByCluster, bpm, clusterText, ledCurve, synth]);
+
+  const clearArpRuntime = useCallback(() => {
+    movementStepRef.current = 0;
+    previousIndexRef.current = null;
+    anchorQueueRef.current = [];
+    anchorEventRef.current = 0;
+    repeatNoteRef.current = null;
+    repeatRemainingRef.current = 0;
+    lastEmittedNoteRef.current = null;
+    avoidIndexRef.current = null;
+    tickCountRef.current = 0;
+    setPlayStep(0);
+  }, []);
+
+  const alignArpRuntime = useCallback((notes: readonly ParsedNote[], settings: ArpSettings, currentNote: ParsedNote | null) => {
+    const fallbackIndex = previousIndexRef.current ?? 0;
+    const transitionIndex = findLiveTransitionIndex(currentNote, notes, fallbackIndex);
+    movementStepRef.current = currentNote ? stepAfterMovementIndex(transitionIndex, notes.length, settings.movement) : 0;
+    previousIndexRef.current = currentNote && notes.length > 0 ? transitionIndex : null;
+    anchorQueueRef.current = [];
+    repeatNoteRef.current = null;
+    repeatRemainingRef.current = 0;
+    avoidIndexRef.current = currentNote && notes.length > 1 ? transitionIndex : null;
+  }, []);
+
+  const settingsForColumn = useCallback((column: number | null | undefined): ArpSettings => {
+    if (column === null || column === undefined || column < 0) return DEFAULT_ARP_SETTINGS;
+    return arpSettingsByClusterRef.current[column] ?? DEFAULT_ARP_SETTINGS;
+  }, []);
+
+  const applyArpSettingsForColumn = useCallback((column: number, nextSettings: ArpSettings) => {
+    if (column < 0 || column >= clustersRef.current.length) return;
+    const currentSettings = settingsForColumn(column);
+    if (nextSettings === currentSettings) return;
+
+    if (activeRef.current === column) {
+      const cluster = clustersRef.current[column];
+      const nextPool = cluster ? buildArpPool(cluster.notes, nextSettings) : [];
+      alignArpRuntime(nextPool, nextSettings, lastEmittedNoteRef.current);
+    }
+
+    const nextSettingsByCluster = reconcileArpSettingsByCluster(arpSettingsByClusterRef.current, clustersRef.current.length);
+    nextSettingsByCluster[column] = nextSettings;
+    arpSettingsByClusterRef.current = nextSettingsByCluster;
+    setArpSettingsByCluster(nextSettingsByCluster);
+    setBlanked(false);
+  }, [alignArpRuntime, settingsForColumn]);
+
+  const requestArpModuleOption = useCallback((x: number, y: number) => {
+    const column = focusedColumnRef.current;
+    const nextSettings = selectArpOption(settingsForColumn(column), x, y);
+    applyArpSettingsForColumn(column, nextSettings);
+  }, [applyArpSettingsForColumn, settingsForColumn]);
+
   const requestColumn = useCallback((x: number, validClusters = clustersRef.current.length) => {
     if (x >= validClusters || x >= 16) return;
     setBlanked(false);
+    focusedColumnRef.current = x;
+    setFocusedColumn(x);
 
     if (activeRef.current === x) {
       activeRef.current = null;
       pendingRef.current = null;
       setActiveColumn(null);
       setPendingColumn(null);
-      stepRef.current = 0;
-      setPlayStep(0);
+      clearArpRuntime();
       return;
     }
 
     pendingRef.current = x;
     setPendingColumn(x);
-  }, []);
+  }, [clearArpRuntime]);
 
   const handleGridKey = useCallback((x: number, y: number, down: boolean) => {
-    if (!down || y !== rows - 1 || x >= clustersRef.current.length || x >= 16) return;
-    void audioRef.current?.ensure().then(() => setAudioOn(true)).catch(() => undefined);
-    requestColumn(x);
-  }, [requestColumn, rows]);
+    if (!down) return;
+    if (y === rows - 1) {
+      if (x >= clustersRef.current.length || x >= 16) return;
+      void audioRef.current?.ensure().then(() => setAudioOn(true)).catch(() => undefined);
+      requestColumn(x);
+      return;
+    }
+
+    if (x < MODULE_COLS && y < MODULE_ROWS) {
+      requestArpModuleOption(x, y);
+      return;
+    }
+  }, [requestArpModuleOption, requestColumn, rows]);
 
   if (!gridRef.current) {
     gridRef.current = new MonomeGridSerial({
@@ -126,6 +277,14 @@ export default function App() {
 
     const next = makeGridLevels(cols, rows, 0);
     const bottom = rows - 1;
+    for (let x = 0; x < Math.min(cols, MODULE_COLS); x += 1) {
+      const module = ARP_MODULES[x];
+      for (let y = 0; y < Math.min(rows, MODULE_ROWS); y += 1) {
+        if (y === bottom) continue;
+        next[y][x] = focusedArpSettings[module.key] === module.options[y] ? 15 : DIM_MODULE_LEVEL;
+      }
+    }
+
     for (let x = 0; x < Math.min(cols, clusters.length, 16); x += 1) {
       next[bottom][x] = activeColumn === x ? 15 : 4;
     }
@@ -135,7 +294,7 @@ export default function App() {
     }
 
     return next;
-  }, [activeColumn, blanked, clusters.length, cols, playStep, rows]);
+  }, [activeColumn, blanked, clusters.length, cols, focusedArpSettings, playStep, rows]);
 
   useEffect(() => {
     gridRef.current?.drawQueued(levels);
@@ -146,26 +305,82 @@ export default function App() {
       let column = activeRef.current;
       if (pendingRef.current !== null) {
         column = pendingRef.current;
+        const pendingSettings = settingsForColumn(column);
+        const nextCluster = clustersRef.current[column];
+        const nextPool = nextCluster ? buildArpPool(nextCluster.notes, pendingSettings) : [];
+        alignArpRuntime(nextPool, pendingSettings, lastEmittedNoteRef.current);
         activeRef.current = column;
         pendingRef.current = null;
-        stepRef.current = 0;
         setActiveColumn(column);
         setPendingColumn(null);
       }
 
       const cluster = clustersRef.current[column ?? -1];
       if (!cluster) return;
+      const settings = settingsForColumn(column);
+      const pool = buildArpPool(cluster.notes, settings);
+      if (pool.length === 0) return;
 
-      const note = cluster.notes[stepRef.current % cluster.notes.length];
-      const pan = cluster.notes.length > 1 ? ((stepRef.current % cluster.notes.length) / Math.max(1, cluster.notes.length - 1)) * 0.8 - 0.4 : 0;
-      audioRef.current?.playMidi(note.midi, eighthMs(bpm) / 1000 * 0.8, 0.16, pan);
-      stepRef.current = (stepRef.current + 1) % cluster.notes.length;
-      setPlayStep(stepRef.current);
+      let selectedNote: ParsedNote | null = null;
+      let selectedIndex: number | null = null;
+
+      if (repeatRemainingRef.current > 0 && repeatNoteRef.current) {
+        selectedNote = repeatNoteRef.current;
+        repeatRemainingRef.current -= 1;
+      } else {
+        const cycleLength = movementCycleLength(pool.length, settings.movement);
+        if (anchorQueueRef.current.length === 0 && movementStepRef.current % cycleLength === 0) {
+          anchorQueueRef.current = applyAnchor(cluster.notes, settings.anchor, anchorEventRef.current);
+          if (anchorQueueRef.current.length > 0) anchorEventRef.current += 1;
+        }
+
+        const anchorNote = anchorQueueRef.current.shift();
+        if (anchorNote) {
+          selectedNote = anchorNote;
+          selectedIndex = pool.findIndex((note) => note.midi === anchorNote.midi);
+        } else {
+          const rawIndex = getMovementIndex(
+            pool.length,
+            settings.movement,
+            movementStepRef.current,
+            Math.random,
+            previousIndexRef.current ?? 0
+          );
+          let nextIndex = applyNeighborhood(rawIndex, previousIndexRef.current, pool.length, settings.neighborhood, Math.random);
+          if (avoidIndexRef.current !== null && nextIndex === avoidIndexRef.current && pool.length > 1) {
+            nextIndex = (nextIndex + 1) % pool.length;
+          }
+
+          avoidIndexRef.current = null;
+          selectedIndex = nextIndex;
+          selectedNote = pool[nextIndex];
+          previousIndexRef.current = nextIndex;
+          movementStepRef.current += 1;
+        }
+
+        if (selectedNote) {
+          repeatNoteRef.current = selectedNote;
+          repeatRemainingRef.current = repeatTickCount(settings.repeat) - 1;
+        }
+      }
+
+      if (!selectedNote) return;
+
+      const octaveNote = applyEmissionOctave(selectedNote, settings.octave, Math.random);
+      const emittedNote = applyProbability(octaveNote, settings.probability, pool, lastEmittedNoteRef.current, Math.random);
+      tickCountRef.current += 1;
+      setPlayStep(tickCountRef.current);
+      if (!emittedNote) return;
+
+      const panIndex = selectedIndex ?? pool.findIndex((note) => note.midi === selectedNote.midi);
+      const pan = pool.length > 1 && panIndex >= 0 ? (panIndex / Math.max(1, pool.length - 1)) * 0.8 - 0.4 : 0;
+      audioRef.current?.playMidi(emittedNote.midi, eighthMs(bpm) / 1000 * 0.8, 0.16, pan);
+      lastEmittedNoteRef.current = emittedNote;
     };
 
     const timer = window.setInterval(tick, eighthMs(bpm));
     return () => window.clearInterval(timer);
-  }, [bpm]);
+  }, [alignArpRuntime, bpm, settingsForColumn]);
 
   useEffect(() => {
     return () => {
@@ -201,7 +416,7 @@ export default function App() {
     pendingRef.current = null;
     setActiveColumn(null);
     setPendingColumn(null);
-    stepRef.current = 0;
+    clearArpRuntime();
     await gridRef.current?.disconnect();
     setConnected(false);
     setStatus("Disconnected.");
@@ -213,19 +428,27 @@ export default function App() {
     setActiveColumn(null);
     setPendingColumn(null);
     setBlanked(true);
+    clearArpRuntime();
     await gridRef.current?.clear();
   };
 
   const resetApp = () => {
+    clearedStorageSnapshotRef.current = storedSettingsFingerprint(defaultStoredSettings());
+    clearStoredSettings();
+    const defaultArpSettingsByCluster = defaultStoredSettings().arpSettingsByCluster;
     setClusterText(DEFAULT_CLUSTERS);
     activeRef.current = null;
     pendingRef.current = null;
+    focusedColumnRef.current = 0;
     setActiveColumn(null);
     setPendingColumn(null);
+    setFocusedColumn(0);
     setBpm(120);
     setLedCurve(45);
     setBlanked(false);
-    stepRef.current = 0;
+    arpSettingsByClusterRef.current = defaultArpSettingsByCluster;
+    setArpSettingsByCluster(defaultArpSettingsByCluster);
+    clearArpRuntime();
     const engine = audioRef.current;
     if (engine) {
       for (const [key, value] of Object.entries(DEFAULT_SYNTH) as [keyof SynthSettings, SynthSettings[keyof SynthSettings]][]) {
@@ -253,13 +476,20 @@ export default function App() {
   };
 
   const pressCell = async (x: number, y: number) => {
-    if (y !== rows - 1 || x >= clusters.length || x >= 16) return;
-    requestColumn(x, clusters.length);
-    try {
-      await audioRef.current?.ensure();
-      setAudioOn(true);
-    } catch (error) {
-      setStatus(`Audio failed: ${error instanceof Error ? error.message : String(error)}`);
+    if (y === rows - 1) {
+      if (x >= clusters.length || x >= 16) return;
+      requestColumn(x, clusters.length);
+      try {
+        await audioRef.current?.ensure();
+        setAudioOn(true);
+      } catch (error) {
+        setStatus(`Audio failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+
+    if (x < MODULE_COLS && y < MODULE_ROWS) {
+      requestArpModuleOption(x, y);
     }
   };
 
@@ -345,7 +575,8 @@ export default function App() {
                 className={[
                   "cluster-pill",
                   activeColumn === index ? "active" : "",
-                  pendingColumn === index ? "pending" : ""
+                  pendingColumn === index ? "pending" : "",
+                  focusedColumn === index ? "focused" : ""
                 ].filter(Boolean).join(" ")}
                 onClick={() => void pressCell(index, rows - 1)}
               >
@@ -359,6 +590,17 @@ export default function App() {
               {parsed.truncated.length > 0 && <p>Only the first 16 valid clusters are assigned to grid columns.</p>}
             </div>
           )}
+
+          <h2>arp</h2>
+          <p className="arp-focus">{clusters[focusedColumn] ? `cluster ${focusedColumn + 1}: ${clusters[focusedColumn].source}` : "no cluster selected"}</p>
+          <dl className="arp-readout">
+            {ARP_MODULES.map((module) => (
+              <div key={module.key}>
+                <dt>{module.label}</dt>
+                <dd>{focusedArpSettings[module.key]}</dd>
+              </div>
+            ))}
+          </dl>
 
           <h2>synth</h2>
           <label className="param param-select">
@@ -401,6 +643,122 @@ export default function App() {
       </section>
     </main>
   );
+}
+
+function defaultStoredSettings(): StoredAppSettings {
+  return {
+    clusterText: DEFAULT_CLUSTERS,
+    bpm: 120,
+    ledCurve: 45,
+    synth: DEFAULT_SYNTH,
+    arpSettingsByCluster: reconcileArpSettingsByCluster([], parseClusterText(DEFAULT_CLUSTERS).clusters.length)
+  };
+}
+
+function loadStoredSettings(): StoredAppSettings | null {
+  if (cachedStoredSettings !== undefined) return cachedStoredSettings;
+  if (typeof window === "undefined") {
+    cachedStoredSettings = null;
+    return cachedStoredSettings;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    cachedStoredSettings = raw ? normalizeStoredSettings(JSON.parse(raw)) : null;
+  } catch {
+    cachedStoredSettings = null;
+  }
+
+  return cachedStoredSettings;
+}
+
+function saveStoredSettings(settings: StoredAppSettings): void {
+  cachedStoredSettings = settings;
+  if (typeof window === "undefined") return;
+
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    // Storage may be unavailable or full; the app should keep running with in-memory state.
+  }
+}
+
+function clearStoredSettings(): void {
+  cachedStoredSettings = null;
+  if (typeof window === "undefined") return;
+
+  try {
+    window.localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // Ignore storage failures; reset still restores the in-memory defaults.
+  }
+}
+
+function storedSettingsFingerprint(settings: StoredAppSettings): string {
+  return JSON.stringify(settings);
+}
+
+function normalizeStoredSettings(value: unknown): StoredAppSettings | null {
+  if (!isRecord(value)) return null;
+  const clusterText = typeof value.clusterText === "string" ? value.clusterText : DEFAULT_CLUSTERS;
+  const clusterCount = parseClusterText(clusterText).clusters.length;
+
+  return {
+    clusterText,
+    bpm: boundedNumber(value.bpm, 40, 220, 120),
+    ledCurve: boundedNumber(value.ledCurve, 0, 100, 45),
+    synth: normalizeStoredSynth(value.synth),
+    arpSettingsByCluster: normalizeStoredArpSettingsByCluster(value.arpSettingsByCluster, clusterCount, value.arpSettings)
+  };
+}
+
+function normalizeStoredSynth(value: unknown): SynthSettings {
+  const record = isRecord(value) ? value : {};
+
+  return {
+    wave: isSynthWave(record.wave) ? record.wave : DEFAULT_SYNTH.wave,
+    attack: boundedNumber(record.attack, 0.003, 0.6, DEFAULT_SYNTH.attack),
+    decay: boundedNumber(record.decay, 0.04, 1.6, DEFAULT_SYNTH.decay),
+    filter: boundedNumber(record.filter, 220, 12000, DEFAULT_SYNTH.filter),
+    q: boundedNumber(record.q, 0.1, 12, DEFAULT_SYNTH.q),
+    drive: boundedNumber(record.drive, 1, 8, DEFAULT_SYNTH.drive),
+    level: boundedNumber(record.level, 0.15, 0.9, DEFAULT_SYNTH.level)
+  };
+}
+
+function normalizeStoredArpSettingsByCluster(value: unknown, clusterCount: number, legacyValue?: unknown): ArpSettings[] {
+  if (Array.isArray(value)) {
+    return reconcileArpSettingsByCluster(value.map(normalizeStoredArpSettings), clusterCount);
+  }
+
+  if (legacyValue !== undefined) {
+    return reconcileArpSettingsByCluster(Array(clusterCount).fill(normalizeStoredArpSettings(legacyValue)), clusterCount);
+  }
+
+  return reconcileArpSettingsByCluster([], clusterCount);
+}
+
+function normalizeStoredArpSettings(value: unknown): ArpSettings {
+  if (!isRecord(value)) return DEFAULT_ARP_SETTINGS;
+
+  let settings = DEFAULT_ARP_SETTINGS;
+  ARP_MODULES.forEach((module, x) => {
+    const optionIndex = module.options.findIndex((option) => option === value[module.key]);
+    if (optionIndex >= 0) settings = selectArpOption(settings, x, optionIndex);
+  });
+  return settings;
+}
+
+function boundedNumber(value: unknown, min: number, max: number, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? clamp(value, min, max) : fallback;
+}
+
+function isSynthWave(value: unknown): value is SynthWave {
+  return value === "square" || value === "sawtooth" || value === "triangle" || value === "sine";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 interface SynthSliderProps {
